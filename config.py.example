@@ -1,0 +1,30 @@
+# LLM Call Configuration
+# Edit this file directly - .env not supported in Claude skills
+
+# OpenRouter API Key (required)
+API_KEY = "sk-or-v1-your-key-here"
+
+# API Endpoint
+ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+
+# Models (OpenRouter format)
+MODELS = {
+    "gpt": "openai/gpt-4.1",
+    "gemini": "google/gemini-2.5-pro-preview-05-06",
+    "grok": "x-ai/grok-3-fast",
+}
+
+# Display names
+MODEL_NAMES = {
+    "gpt": "GPT-4.1",
+    "gemini": "Gemini-2.5-Pro",
+    "grok": "Grok-3-Fast",
+}
+
+# Request settings
+MAX_TOKENS = 4096
+TEMPERATURE = 0.7
+TIMEOUT = 120  # seconds
+
+# Session storage
+SESSION_DIR = "/tmp/llm-call-sessions"
