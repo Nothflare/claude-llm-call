@@ -16,7 +16,7 @@ This surfaces blind spots, validates reasoning, and expands solution spaces.
 
 1. Clone this repo
 2. Edit `config.py` with your API key and endpoint
-3. Delete this README.md
+3. Delete README.md to make it cleaner
 4. Compress the repo into a .zip file and upload it to (https://claude.ai/settings/capabilities)[https://claude.ai/settings/capabilities]
 
 ## Triggers (Claude will use this skill when one is present)
@@ -46,5 +46,6 @@ External models **cannot**:
 - Use tools
 - See files
 - Access conversation history
+
 
 Claude must include all relevant context in the query.
