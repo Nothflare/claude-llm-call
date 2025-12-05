@@ -5,282 +5,298 @@ import sys
 import os
 import argparse
 
-# Add parent dir to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import config
-from llm.api import call_llm, resolve_model, model_name
+from llm import models
+from llm.caller import call, call_parallel
+from llm.parse import parse_stdin
 from llm.session import (
-    new_session, get_current_session, get_session_path,
-    write_session_file, read_session_file, session_file_exists,
-    clear_session, list_sessions
+    new_session, get_current_session, get_session_path, clear_session,
+    get_current_step, create_next_step, save_step_data, load_step_data, get_session_context
 )
-from llm.council import run_council_workflow, get_context, call_single_model
 
+
+# ============================================================================
+# Commands
+# ============================================================================
 
 def cmd_single(args):
     """Query single model."""
     if not args.model:
-        print("[ERROR] Model required (-M gpt|gemini|grok)")
-        sys.exit(1)
-    
-    content = read_input(args)
-    if not content:
-        print("[ERROR] No input. Use -f <file> or pipe stdin.")
-        sys.exit(1)
-    
-    print(f"[llm-call] Querying {model_name(args.model)}...")
-    result = call_single_model(args.model, content)
-    
-    if result["success"]:
-        print(result["content"])
-    else:
-        print(f"[ERROR] {result['error']}")
+        print("ERROR: -M required (gpt|gemini|grok)")
         sys.exit(1)
 
-
-def cmd_init(args):
-    """Initialize new session."""
-    content = read_input(args)
-    if not content:
-        print("[ERROR] No query. Use -f <file> or pipe stdin.")
+    stdin = _require_stdin()
+    data = parse_stdin(stdin)
+    if not data["query"]:
+        print("ERROR: No ===QUERY=== found")
         sys.exit(1)
-    
-    session_id = new_session()
-    write_session_file("query.txt", content, session_id)
-    
-    # Clean up staging file
-    if args.file and args.file.startswith("/tmp/") and os.path.exists(args.file):
-        os.remove(args.file)
-    
-    print(session_id)
 
+    session_id, step = _get_or_create_session(args.session)
+    result = call(args.model, data["query"])
 
-def cmd_draft(args):
-    """Store Claude's draft."""
-    content = read_input(args)
-    if not content:
-        print("[ERROR] No draft content. Use -f <file> or pipe stdin.")
+    if not result["success"]:
+        print(f"ERROR: {result['error']}")
         sys.exit(1)
-    
-    session_id = args.session or get_current_session()
-    if not session_id:
-        print("[ERROR] No active session. Run init first.")
-        sys.exit(1)
-    
-    write_session_file("draft.txt", content, session_id)
-    
-    # Clean up staging file
-    if args.file and args.file.startswith("/tmp/") and os.path.exists(args.file):
-        os.remove(args.file)
-    
-    print("[llm-call] Draft stored")
+
+    save_step_data(step, {
+        "query": data["query"],
+        args.model: result["content"],
+        **({"draft": data["draft"]} if data["draft"] else {})
+    }, session_id)
+
+    _print_result(result)
+    print(f"[{session_id} step {step}]")
 
 
 def cmd_council(args):
-    """Run council on session query."""
-    session_id = args.session or get_current_session()
-    if not session_id:
-        print("[ERROR] No active session. Run init first.")
-        sys.exit(1)
-    
-    try:
-        run_council_workflow(session_id, args.confidence)
-        print()
-        print("Run: llm-call -m context")
-    except ValueError as e:
-        print(f"[ERROR] {e}")
+    """Query all models in parallel."""
+    stdin = _require_stdin()
+    data = parse_stdin(stdin)
+    if not data["query"]:
+        print("ERROR: No ===QUERY=== found")
         sys.exit(1)
 
+    session_id, step = _get_or_create_session(args.session)
+    results = call_parallel(data["query"], add_confidence=args.confidence)
 
-def cmd_context(args):
-    """Display full session context."""
-    session_id = args.session or get_current_session()
-    if not session_id:
-        print("[ERROR] No active session. Run init first.")
-        sys.exit(1)
-    
-    try:
-        print(get_context(session_id))
-    except ValueError as e:
-        print(f"[ERROR] {e}")
-        sys.exit(1)
+    # Save
+    step_data = {"query": data["query"]}
+    if data["draft"]:
+        step_data["draft"] = data["draft"]
+    for key, result in results.items():
+        if result["success"]:
+            step_data[key] = result["content"]
+    save_step_data(step, step_data, session_id)
+
+    # Output
+    print()
+    for result in results.values():
+        _print_result(result)
+    print(f"[{session_id} step {step}]")
 
 
 def cmd_probe(args):
-    """Follow-up question to specific model."""
-    if not args.model:
-        print("[ERROR] Model required (-M gpt|gemini|grok)")
-        sys.exit(1)
-    
-    content = read_input(args)
-    if not content:
-        print("[ERROR] No probe query. Use -f <file> or pipe stdin.")
-        sys.exit(1)
-    
-    session_id = args.session or get_current_session()
-    if not session_id:
-        print("[ERROR] No active session. Run init first.")
-        sys.exit(1)
-    
-    # Build context
-    ctx_parts = []
-    
-    query = read_session_file("query.txt", session_id)
-    if query:
-        ctx_parts.append(f"Original question: {query}")
-    
-    # Previous response from this model
-    prev = read_session_file(f"council/{args.model}.txt", session_id)
-    if prev and not prev.startswith("[[FAILED]]"):
-        ctx_parts.append(f"Your previous answer:\n{prev}")
-    
-    # Other models' responses
-    ctx_parts.append("Other models said:")
-    for key in config.MODELS.keys():
-        if key == args.model:
-            continue
-        other = read_session_file(f"council/{key}.txt", session_id)
-        if other and not other.startswith("[[FAILED]]"):
-            name = model_name(key)
-            # Truncate if too long
-            if len(other) > 1500:
-                other = other[:1500] + "..."
-            ctx_parts.append(f"\n--- {name} ---\n{other}")
-    
-    ctx_parts.append(f"\n---\nFollow-up question:\n{content}")
-    
-    full_prompt = "\n\n".join(ctx_parts)
-    
-    print(f"[llm-call] Probing {model_name(args.model)}...")
-    result = call_single_model(args.model, full_prompt)
-    
-    if result["success"]:
-        # Save probe
-        probe_dir = os.path.join(get_session_path(session_id), "probes")
-        os.makedirs(probe_dir, exist_ok=True)
-        n = 1
-        while os.path.exists(os.path.join(probe_dir, f"{args.model}_{n}.txt")):
-            n += 1
-        with open(os.path.join(probe_dir, f"{args.model}_{n}.txt"), "w") as f:
-            f.write(result["content"])
-        with open(os.path.join(probe_dir, f"{args.model}_{n}_q.txt"), "w") as f:
-            f.write(content)
-        
-        print(f"\n=== {result['name']} (probe {n}) ===")
-        print(result["content"])
-    else:
-        print(f"[ERROR] {result['error']}")
+    """Follow-up question with session context."""
+    stdin = _require_stdin()
+    data = parse_stdin(stdin)
+    if not data["query"]:
+        print("ERROR: No ===QUERY=== found")
         sys.exit(1)
 
+    target = args.model or data["probe_model"]
+    if not target:
+        print("ERROR: Specify model with -M or ===PROBE=== @model")
+        sys.exit(1)
 
-def cmd_clear(args):
-    """Clear session."""
     session_id = args.session or get_current_session()
     if not session_id:
-        print("[ERROR] No active session.")
+        print("ERROR: No session")
         sys.exit(1)
-    
-    clear_session(session_id)
-    print(f"[llm-call] Cleared: {session_id}")
+
+    # Build context from session history
+    context = []
+    for step_info in get_session_context(session_id):
+        step_data = step_info["data"]
+        context.append(f"--- Step {step_info['step']} ---")
+        if "query" in step_data:
+            context.append(f"Q: {step_data['query']}")
+        for key in models.ALL_KEYS:
+            if key in step_data:
+                resp = step_data[key][:800] + "..." if len(step_data[key]) > 800 else step_data[key]
+                context.append(f"{models.name(key)}: {resp}")
+    context.append(f"\n--- New Q ---\n{data['query']}")
+
+    result = call(target, "\n\n".join(context), label="Probe")
+    if not result["success"]:
+        print(f"ERROR: {result['error']}")
+        sys.exit(1)
+
+    step = create_next_step(session_id)
+    save_step_data(step, {"query": data["query"], target: result["content"]}, session_id)
+
+    _print_result(result, suffix="Probe")
+    print(f"[{session_id} step {step}]")
+
+
+def cmd_crossref(args):
+    """Models critique each other's responses."""
+    session_id = args.session or get_current_session()
+    if not session_id:
+        print("ERROR: No session")
+        sys.exit(1)
+
+    current_step = get_current_step(session_id)
+    step_data = load_step_data(current_step, session_id)
+
+    # Check for stdin draft
+    if not sys.stdin.isatty():
+        data = parse_stdin(sys.stdin.read())
+        if data["draft"] and "draft" not in step_data:
+            save_step_data(current_step, {"draft": data["draft"]}, session_id)
+            step_data["draft"] = data["draft"]
+
+    query = step_data.get("query", "")
+    draft = step_data.get("draft", "")
+    model_responses = {k: step_data.get(k) for k in models.ALL_KEYS}
+
+    # Need at least 1 response
+    if not any(model_responses.values()) and not draft:
+        print("ERROR: Need at least 1 response. Run council first.")
+        sys.exit(1)
+
+    # Require draft for crossref - Claude's perspective is essential
+    if not draft:
+        print("ERROR: No draft found. Crossref requires Claude's draft to compare perspectives.")
+        sys.exit(1)
+
+    # Build prompts (each model sees others' responses)
+    prompts = {}
+    for key in models.ALL_KEYS:
+        others = []
+        if draft:
+            others.append(f"Claude: {draft}")
+        for k, v in model_responses.items():
+            if k != key and v:
+                others.append(f"{models.name(k)}: {v}")
+
+        parts = []
+        if query:
+            parts.append(f"Original Q: {query}")
+        if model_responses[key]:
+            parts.append(f"\nYour previous answer:\n{model_responses[key]}")
+        parts.append("\nOther responses:\n" + "\n".join(others))
+        parts.append("\n---\nComment on others' responses. Agree/disagree? What insights or errors do you see?")
+        prompts[key] = "\n".join(parts)
+
+    results = call_parallel(prompts, label="Crossref")
+
+    step = create_next_step(session_id)
+    new_step_data = {"query": "Crossref"}
+    print()
+    for key, result in results.items():
+        if result["success"]:
+            new_step_data[f"{key}_crossref"] = result["content"]
+        _print_result(result, suffix="Crossref")
+
+    save_step_data(step, new_step_data, session_id)
+    print(f"[{session_id} step {step}]")
 
 
 def cmd_status(args):
     """Show session status."""
     session_id = args.session or get_current_session()
     if not session_id:
-        print("[ERROR] No active session.")
-        sys.exit(1)
-    
-    try:
-        path = get_session_path(session_id)
-        print(f"Session: {session_id}")
-        print(f"Path: {path}")
-        print()
-        
-        if session_file_exists("query.txt", session_id):
-            print("✓ query.txt")
-        if session_file_exists("draft.txt", session_id):
-            print("✓ draft.txt")
-        
-        council_dir = os.path.join(path, "council")
-        if os.path.isdir(council_dir):
-            files = [f for f in os.listdir(council_dir) if f.endswith(".txt")]
-            print(f"✓ council/ ({len(files)} files)")
-        
-        probes_dir = os.path.join(path, "probes")
-        if os.path.isdir(probes_dir):
-            files = [f for f in os.listdir(probes_dir) if f.endswith(".txt") and "_q" not in f]
-            print(f"✓ probes/ ({len(files)} probes)")
-            
-    except ValueError as e:
-        print(f"[ERROR] {e}")
+        print("ERROR: No session")
         sys.exit(1)
 
+    path = get_session_path(session_id)
+    steps = sorted([d for d in os.listdir(path) if d.isdigit()], key=int)
+    print(f"{session_id}: {len(steps)} steps")
+    for step in steps:
+        files = [f.replace('.md', '') for f in os.listdir(os.path.join(path, step)) if f.endswith('.md')]
+        print(f"  {step}/: {', '.join(files)}")
 
-def read_input(args) -> str:
-    """Read input from file or stdin."""
-    if args.file:
-        if not os.path.exists(args.file):
-            print(f"[ERROR] File not found: {args.file}")
-            sys.exit(1)
-        with open(args.file) as f:
-            return f.read()
-    elif not sys.stdin.isatty():
-        return sys.stdin.read()
-    return ""
 
+def cmd_clear(args):
+    """Clear session."""
+    session_id = args.session or get_current_session()
+    if not session_id:
+        print("ERROR: No session")
+        sys.exit(1)
+    clear_session(session_id)
+    print(f"Cleared {session_id}")
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+def _require_stdin() -> str:
+    """Require and return stdin content."""
+    if sys.stdin.isatty():
+        print("ERROR: Pipe stdin with ===QUERY===")
+        sys.exit(1)
+    return sys.stdin.read()
+
+
+def _get_or_create_session(session_arg: str = None) -> tuple:
+    """Get or create session, return (session_id, step)."""
+    if session_arg == "new":
+        # Force new session
+        session_id = new_session()
+        step = 1
+    elif session_arg:
+        # Use specified session
+        session_id = session_arg
+        step = create_next_step(session_id)
+    else:
+        # Use current or create new
+        session_id = get_current_session() or new_session()
+        step = 1 if get_current_step(session_id) == 1 else create_next_step(session_id)
+    return session_id, step
+
+
+def _print_result(result: dict, suffix: str = ""):
+    """Print formatted result."""
+    name = result["name"]
+    if suffix:
+        name = f"{name} ({suffix})"
+    print(f"### {name}\n")
+    if result["success"]:
+        print(f"{result['content']}\n")
+    else:
+        # Show detailed error info so Claude knows what happened
+        error = result.get('error', 'Unknown error')
+        model = result.get('model', result.get('key', 'unknown'))
+        print(f"[ERROR] Call to {model} failed: {error}\n")
+
+
+# ============================================================================
+# Main
+# ============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="LLM Call - External LLM orchestration for Claude",
+        description="LLM Call - External LLM orchestration",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Modes:
-  single    Query one model (requires -M)
-  init      Start new session with query
-  draft     Store Claude's draft in session
   council   Query all models in parallel
-  context   Display session (query + draft + responses)
-  probe     Follow-up to specific model (requires -M)
-  status    Show session files
+  single    Query one model (-M required)
+  probe     Follow-up with session context
+  crossref  Models critique each other
+  status    Show session
   clear     Delete session
 
-Examples:
-  echo "Question" | llm-call -m single -M gpt
-  llm-call -m init -f /tmp/query.txt
-  llm-call -m draft -f /tmp/draft.txt
-  llm-call -m council -c
-  llm-call -m context
+Input format (stdin):
+  ===QUERY===
+  Your question
+
+  ===DRAFT===  (optional)
+  Claude's answer
+
+  ===PROBE===  (probe mode)
+  @gpt/@gemini/@grok/@qwen
 """
     )
-    
+
     parser.add_argument("-m", "--mode", required=True,
-                        choices=["single", "init", "draft", "council", "context", "probe", "status", "clear"],
-                        help="Operation mode")
-    parser.add_argument("-M", "--model", choices=["gpt", "gemini", "grok"],
-                        help="Target model")
-    parser.add_argument("-f", "--file", help="Read input from file")
-    parser.add_argument("-S", "--session", help="Use specific session ID")
-    parser.add_argument("-c", "--confidence", action="store_true",
-                        help="Request confidence ratings")
-    parser.add_argument("-q", "--quiet", action="store_true",
-                        help="Quiet mode")
-    
+                        choices=["council", "single", "probe", "crossref", "status", "clear"])
+    parser.add_argument("-M", "--model", choices=models.ALL_KEYS)
+    parser.add_argument("-S", "--session", help="Session ID")
+    parser.add_argument("-c", "--confidence", action="store_true")
+
     args = parser.parse_args()
-    
-    # Dispatch to command
+
     commands = {
-        "single": cmd_single,
-        "init": cmd_init,
-        "draft": cmd_draft,
         "council": cmd_council,
-        "context": cmd_context,
+        "single": cmd_single,
         "probe": cmd_probe,
+        "crossref": cmd_crossref,
         "status": cmd_status,
         "clear": cmd_clear,
     }
-    
     commands[args.mode](args)
 
 

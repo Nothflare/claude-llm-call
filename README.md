@@ -1,6 +1,6 @@
 # Claude LLM Call
 
-A Claude skill for querying external LLMs (GPT, Gemini, Grok) to get independent perspectives on problems.
+A Claude skill for querying external LLMs (GPT, Gemini, Grok, Qwen) to get independent perspectives on problems.
 
 ## Why?
 
@@ -23,10 +23,13 @@ This surfaces blind spots, validates reasoning, and expands solution spaces.
 
 | Trigger | Action |
 |---------|--------|
-| `@council` | Query GPT, Gemini, Grok in parallel |
+| `@council` | Query GPT, Gemini, Grok, Qwen in parallel |
 | `@gpt` | GPT only |
 | `@gemini` | Gemini only |
 | `@grok` | Grok only |
+| `@qwen` | Qwen only |
+| `@probe` | Follow-up question with auto-context from session history |
+| `@crossref` | Models comment on each other's previous responses |
 
 No trigger → Claude handles alone.
 
